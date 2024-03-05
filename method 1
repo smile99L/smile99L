@@ -1,0 +1,268 @@
+#include <iostream>
+#include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/features/principal_curvatures.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/segmentation/region_growing.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <sstream>
+#include <map> 
+
+// 下采样参数
+const float leaf_size = 0.01;
+// 曲率阈值
+const double threshold_curvature = 0.02;
+
+int main() {
+    // 加载点云数据
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::io::loadPCDFile<pcl::PointXYZ>("614daseg.pcd", *cloud);
+
+    // 计算模型中心坐标
+    pcl::PointXYZ center;
+    for (const pcl::PointXYZ& point : cloud->points) {
+        center.x += point.x;
+        center.y += point.y;
+        center.z += point.z;
+    }
+    center.x /= cloud->size();
+    center.y /= cloud->size();
+    center.z /= cloud->size();
+
+    // 移动点云到中心位置
+    pcl::PointCloud<pcl::PointXYZ>::Ptr centered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    centered_cloud->resize(cloud->size());
+    for (pcl::PointXYZ& point : centered_cloud->points) {
+        point.x = point.x - center.x;
+        point.y = point.y - center.y;
+        point.z = point.z - center.z;
+    }
+
+    // 创建PCLVisualizer
+    pcl::visualization::PCLVisualizer viewer("PointCloud Visualizer");
+    viewer.setBackgroundColor(0.0, 0.0, 0.0);
+
+    // 点云下采样
+    pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_grid;
+    voxel_grid.setInputCloud(cloud);
+    voxel_grid.setLeafSize(leaf_size, leaf_size, leaf_size);
+    voxel_grid.filter(*downsampled_cloud);
+
+    // 计算法线和曲率
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+    ne.setInputCloud(downsampled_cloud);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+    ne.setSearchMethod(tree);
+    pcl::PointCloud<pcl::Normal>::Ptr cloud_normals(new pcl::PointCloud<pcl::Normal>);
+    ne.setKSearch(20);
+    ne.compute(*cloud_normals);
+
+    pcl::PrincipalCurvaturesEstimation<pcl::PointXYZ, pcl::Normal, pcl::PrincipalCurvatures> pc;
+    pc.setInputCloud(downsampled_cloud);
+    pc.setInputNormals(cloud_normals);
+    pcl::PointCloud<pcl::PrincipalCurvatures>::Ptr cloud_curvatures(new pcl::PointCloud<pcl::PrincipalCurvatures>);
+    pc.setKSearch(20);
+    pc.compute(*cloud_curvatures);
+
+    // 创建裂缝点云
+    pcl::PointCloud<pcl::PointXYZ>::Ptr crack_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+
+    // 创建RegionGrowing对象
+    pcl::RegionGrowing<pcl::PointXYZ, pcl::Normal> reg;
+    reg.setMinClusterSize(10); // 设置区域最小点数
+    reg.setMaxClusterSize(100000); // 设置区域最大点数
+    reg.setSearchMethod(tree);
+    reg.setNumberOfNeighbours(30); // 设置邻居点数
+    reg.setInputCloud(downsampled_cloud);
+    reg.setInputNormals(cloud_normals);
+    reg.setSmoothnessThreshold(5.0 / 180.0 * M_PI); // 设置平滑度阈值
+    reg.setCurvatureThreshold(1.0); // 设置曲率阈值
+
+    std::vector<pcl::PointIndices> clusters;
+    reg.extract(clusters);
+
+    // 创建颜色点云
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    colored_cloud->resize(downsampled_cloud->size());
+    for (std::size_t i = 0; i < downsampled_cloud->size(); ++i) {
+        colored_cloud->points[i].r = 255;
+        colored_cloud->points[i].g = 0;
+        colored_cloud->points[i].b = 0; // 默认为黑色
+        colored_cloud->points[i].x = downsampled_cloud->points[i].x;
+        colored_cloud->points[i].y = downsampled_cloud->points[i].y;
+        colored_cloud->points[i].z = downsampled_cloud->points[i].z;
+    }
+
+    // 标记和编号裂缝区域，并创建编号与点云的映射关系
+    int cluster_number = 1;
+    std::map<int, pcl::PointCloud<pcl::PointXYZRGB>::Ptr> cluster_map;
+    for (const pcl::PointIndices& cluster : clusters) {
+        if (cluster.indices.size() > 10000) {
+            for (const int& index : cluster.indices) {
+                colored_cloud->points[index].r = 0;
+                colored_cloud->points[index].g = 255;
+                colored_cloud->points[index].b = 0; // 绿色表示大区域的弧面
+            }
+        }
+        else if (cluster.indices.size() >= 40) { // 只标号点云数量大于等于40的裂缝区域
+            // 给整个独立区域添加一个唯一的标号
+            pcl::PointXYZRGB label_point;
+            label_point.x = downsampled_cloud->points[cluster.indices[0]].x;
+            label_point.y = downsampled_cloud->points[cluster.indices[0]].y;
+            label_point.z = downsampled_cloud->points[cluster.indices[0]].z;
+            label_point.r = 255;
+            label_point.g = 0;
+            label_point.b = 0;
+            std::string label_id = "label" + std::to_string(cluster_number);
+            viewer.addText3D(std::to_string(cluster_number), label_point, 0.02, 1.0, 1.0, 1.0, label_id);
+
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr cluster_points(new pcl::PointCloud<pcl::PointXYZRGB>);
+            cluster_points->resize(cluster.indices.size());
+            for (std::size_t i = 0; i < cluster.indices.size(); ++i) {
+                int index = cluster.indices[i];
+                cluster_points->points[i] = colored_cloud->points[index];
+            }
+            cluster_map[cluster_number] = cluster_points;
+
+            cluster_number++;
+        }
+    }
+
+    // 遍历默认的点云
+    for (std::size_t i = 0; i < downsampled_cloud->size(); ++i) {
+        // 检查该点是否已经被编号
+        if (colored_cloud->points[i].r == 0 && colored_cloud->points[i].g == 255 && colored_cloud->points[i].b == 0) {
+            continue; // 跳过已经被编号的点
+        }
+
+        // 获取默认点的坐标
+        float default_point_x = downsampled_cloud->points[i].x;
+        float default_point_y = downsampled_cloud->points[i].y;
+        float default_point_z = downsampled_cloud->points[i].z;
+
+        // 遍历所有已编号的区域
+        for (const auto& pair : cluster_map) {
+            int cluster_number = pair.first;
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr cluster_points = pair.second;
+
+            // 获取编号点云的质心坐标
+            pcl::PointXYZRGB cluster_centroid;
+            cluster_centroid.x = 0.0;
+            cluster_centroid.y = 0.0;
+            cluster_centroid.z = 0.0;
+
+            for (const pcl::PointXYZRGB& point : cluster_points->points) {
+                cluster_centroid.x += point.x;
+                cluster_centroid.y += point.y;
+                cluster_centroid.z += point.z;
+            }
+
+            cluster_centroid.x /= cluster_points->size();
+            cluster_centroid.y /= cluster_points->size();
+            cluster_centroid.z /= cluster_points->size();
+
+            // 计算默认点与编号点的距离
+            float distance = sqrt(pow(default_point_x - cluster_centroid.x, 2) +
+                pow(default_point_y - cluster_centroid.y, 2) +
+                pow(default_point_z - cluster_centroid.z, 2));
+
+            // 如果距离小于5cm，则将默认点合并到编号中
+            if (distance < 0.045) {
+                // 设置默认点的颜色为红色
+                colored_cloud->points[i].r = 255;
+                colored_cloud->points[i].g = 0;
+                colored_cloud->points[i].b = 0;
+
+                // 将默认点添加到相应的编号中
+                cluster_points->push_back(colored_cloud->points[i]);
+            }
+        }
+    }
+
+    // 将带有标记区域的已处理点云添加到第一个查看器
+    pcl::visualization::PointCloudColorHandlerRGBField<pcl::PointXYZRGB> rgb(colored_cloud);
+    viewer.addPointCloud<pcl::PointXYZRGB>(colored_cloud, rgb, "colored_cloud");
+
+    // 设置第一个查看器的摄像机位置
+    viewer.setCameraPosition(center.x, center.y, center.z + 2.0, center.x, center.y, center.z, 0.0, 1.0, 0.0);
+
+    // 创建用于显示红色点云的 PCLVisualizer
+    pcl::visualization::PCLVisualizer red_viewer("Red Points Viewer");
+    red_viewer.setBackgroundColor(0.0, 0.0, 0.0);
+
+    // 在第二个视图中，使用映射关系将编号和点云添加到视图，并添加三维框架及标签
+    for (const auto& pair : cluster_map) {
+        int cluster_number = pair.first;
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cluster_points = pair.second;
+
+        // 手动计算点云的包围框
+        pcl::PointXYZRGB min_point, max_point;
+        min_point.x = max_point.x = cluster_points->points[0].x;
+        min_point.y = max_point.y = cluster_points->points[0].y;
+        min_point.z = max_point.z = cluster_points->points[0].z;
+
+        for (const pcl::PointXYZRGB& point : cluster_points->points) {
+            if (point.x < min_point.x) min_point.x = point.x;
+            if (point.y < min_point.y) min_point.y = point.y;
+            if (point.z < min_point.z) min_point.z = point.z;
+
+            if (point.x > max_point.x) max_point.x = point.x;
+            if (point.y > max_point.y) max_point.y = point.y;
+            if (point.z > max_point.z) max_point.z = point.z;
+        }
+
+        // 计算包围框的长宽高
+        float width = max_point.x - min_point.x;
+        float height = max_point.y - min_point.y;
+        float depth = max_point.z - min_point.z;
+
+        // 获取包围框的中心位置
+        float centroid_x = min_point.x + width / 2;
+        float centroid_y = min_point.y + height / 2;
+        float centroid_z = min_point.z + depth / 2;
+
+        // 确保 width <= height，如果不是，则交换它们的值
+        if (width > height) {
+            std::swap(width, height);
+        }
+
+        // 添加合并的标签文本
+        std::string combined_label = "Dimensions: " + std::to_string(width) + "m x " +
+            std::to_string(height) + "m x " +
+            std::to_string(depth) + "m";
+
+        // 添加包围框
+        red_viewer.addCube(min_point.x, min_point.y, min_point.z, max_point.x, max_point.y, max_point.z,
+            1.0, 0.0, 0.0, "cube_" + std::to_string(cluster_number));
+
+        // 添加合并的标签文本到视图
+        pcl::PointXYZRGB label_point;
+        label_point.x = centroid_x;
+        label_point.y = centroid_y;
+        label_point.z = centroid_z + 0.1; // 调整标签高度
+        label_point.r = 255;
+        label_point.g = 255;
+        label_point.b = 255;
+        std::string label_id = "label_" + std::to_string(cluster_number);
+        red_viewer.addText3D(combined_label, label_point, 0.02, 1.0, 1.0, 1.0, label_id);
+
+        // 添加点云到红色点云查看器
+        pcl::visualization::PointCloudColorHandlerRGBField<pcl::PointXYZRGB> cluster_rgb(cluster_points);
+        red_viewer.addPointCloud<pcl::PointXYZRGB>(cluster_points, cluster_rgb, "cluster_" + std::to_string(cluster_number));
+    }
+
+    // 设置红色点云查看器的相机位置
+    red_viewer.setCameraPosition(center.x, center.y, center.z + 2.0, center.x, center.y, center.z, 0.0, 1.0, 0.0);
+
+    // 旋转红色点云查看器
+    while (!red_viewer.wasStopped()) {
+        red_viewer.spinOnce();
+    }
+
+    return 0;
+}
